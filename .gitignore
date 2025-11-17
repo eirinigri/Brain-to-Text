@@ -1,0 +1,67 @@
+# T15 Neural Data - Large HDF5 files
+t15_copyTask_neuralData/
+t15_pretrained_rnn_baseline/
+*.hdf5
+
+# Common Python ignores
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv/
+.env
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints
+
+# Model checkpoints and logs (if large)
+*.pt
+*.pth
+*.ckpt
+training_log
+checkpoint/
+
+# Data files (uncomment if needed)
+# *.csv
+# *.json
+# *.pkl
+# *.npy
+# *.npz
