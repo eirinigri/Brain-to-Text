@@ -1,0 +1,529 @@
+\documentclass[12pt,a4paper]{article}
+
+\usepackage[margin=2.5cm]{geometry}
+\usepackage{graphicx}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{enumitem}
+\usepackage{float}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{fancyhdr}
+\usepackage{titlesec}
+\usepackage{parskip}
+
+% --- Page style ---
+\pagestyle{fancy}
+\fancyhf{}
+\rhead{\thepage}
+\lhead{Brain-to-Text '25 -- Neural Speech Decoding}
+\renewcommand{\headrulewidth}{0.4pt}
+
+% --- Hyperlinks ---
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue!70!black,
+    citecolor=blue!70!black,
+    urlcolor=blue!70!black
+}
+
+% --- Section formatting ---
+\titleformat{\section}{\Large\bfseries}{\thesection.}{0.5em}{}
+\titleformat{\subsection}{\large\bfseries}{\thesubsection.}{0.5em}{}
+\titleformat{\subsubsection}{\normalsize\bfseries}{\thesubsubsection.}{0.5em}{}
+
+\begin{document}
+
+% ============================================================
+% TITLE PAGE
+% ============================================================
+\begin{titlepage}
+\centering
+\vspace*{2cm}
+
+{\Huge\bfseries Neural Speech Decoding:\\[0.3em] Brain-to-Text with Conformer\\[0.3em] and Session Adapters}
+
+\vspace{1.5cm}
+
+{\Large Brain-to-Text '25 Competition}
+
+\vspace{2cm}
+
+{\large
+\textbf{Authors:}\\[0.5em]
+Vasileios Feidantsis\\
+Eirini Griniezaki
+}
+
+\vspace{2cm}
+
+{\large
+\textbf{HY573 / Institution:}\\[0.5em]
+CS-573 Optimization Methods\\
+University of Crete
+}
+
+\vspace{2cm}
+
+{\large February 2026}
+
+\vfill
+\end{titlepage}
+
+% ============================================================
+% TABLE OF CONTENTS
+% ============================================================
+\tableofcontents
+\newpage
+
+% ============================================================
+% 1. INTRODUCTION
+% ============================================================
+\section{Introduction}
+
+\subsection{Problem Statement}
+
+The goal of this project is to develop algorithms that decode speech directly from neural activity (time series of brain signals) into text. This technology is crucial for restoring communication to individuals with severe motor disabilities, particularly those suffering from \textbf{Amyotrophic Lateral Sclerosis (ALS)} or \textbf{brainstem stroke}, who have lost the ability to move and speak.
+
+The computational problem can be formally described as:
+\begin{itemize}
+    \item \textbf{Input:} Variable-length time series of neural activity (512-dimensional feature vectors per time step).
+    \item \textbf{Output:} Text (natural language), represented as a sequence of phonemes.
+    \item \textbf{Alignment:} No ground-truth alignment is provided between neural activity and text, making this essentially a sequence-to-sequence problem with unknown alignment.
+\end{itemize}
+
+\subsection{Motivation}
+
+Previous work on brain-computer interfaces (BCIs) has shown that speech can be decoded from intracortical neural recordings. Recent advances in the field have reduced Word Error Rate (WER) from 11.06\% to 5.77\% on benchmark datasets. Building on these advances, our work utilizes data from participant T15, spanning 45 recording sessions over approximately 20 months (August 2023 -- April 2025).
+
+\subsection{Evaluation Metric}
+
+The primary metric is the \textbf{Word Error Rate (WER)}, defined as:
+
+\begin{equation}
+    \text{WER} = \frac{S + D + I}{N}
+\end{equation}
+
+where $S$ is the number of substitutions, $D$ is the number of deletions, $I$ is the number of insertions, and $N$ is the total number of words in the reference. Our objective is to minimize WER through an optimized acoustic model, with the understanding that further reductions are achievable through language model integration.
+
+\subsection{Design Constraints}
+
+Our system is designed with the following constraints in mind:
+\begin{enumerate}
+    \item \textbf{Generalization:} The model must handle different types of speech (e.g., ``random word'' sentences vs.\ standard sentences) without manual intervention. Automatic detection of corpus/style is preferred.
+    \item \textbf{Autonomous operation:} The system should not require manual corpus selection at inference time, ensuring practical deployability.
+\end{enumerate}
+
+% ============================================================
+% 2. DATASET
+% ============================================================
+\section{Dataset}
+
+\subsection{Data Description}
+
+The dataset comes from participant \textbf{T15}, a patient with intracortical electrode arrays implanted for neural speech decoding, provided as part of the Brain-to-Text '25 benchmark. The data is organized into \textbf{HDF5 files} across multiple recording sessions.
+
+\begin{table}[H]
+\centering
+\caption{Dataset Overview}
+\renewcommand{\arraystretch}{1.3}
+\begin{tabular}{lc}
+    \toprule
+    \textbf{Property} & \textbf{Value} \\
+    \midrule
+    Total recording sessions & 45 \\
+    Time span & August 2023 -- April 2025 \\
+    Training trials & 8,072 \\
+    Validation trials & 1,426 \\
+    Test trials & 1,450 \\
+    Feature dimensionality & 512 \\
+    Output classes & 41 (40 phonemes + CTC blank) \\
+    \bottomrule
+\end{tabular}
+\label{tab:dataset}
+\end{table}
+
+\subsection{Feature Space}
+
+Each trial consists of a variable-length sequence of \textbf{512-dimensional neural feature vectors}. These features represent binned spike counts or neural activity power estimates from the implanted electrode arrays. The variable sequence lengths reflect different utterance durations, ranging from short words to full sentences.
+
+\subsection{Target Labels}
+
+The target labels are sequences of \textbf{phoneme IDs} from a vocabulary of 40 phonemes based on the ARPAbet system:
+
+\begin{center}
+\small
+AA, AE, AH, AO, AW, AY, B, CH, D, DH, EH, ER, EY, F, G, HH, IH, IY, JH, K, L, M, N, NG, OW, OY, P, R, S, SH, T, TH, UH, UW, V, W, Y, Z, ZH, $|$ (word boundary)
+\end{center}
+
+An additional \textbf{blank token} (ID = 0) is used for the CTC decoding framework, yielding 41 total output classes.
+
+\subsection{Session Distribution}
+
+The 45 sessions are distributed unevenly across the 20-month recording period. Notably, some sessions lack validation or test splits (e.g., sessions \texttt{t15.2023.08.11}, \texttt{t15.2024.03.03}, \texttt{t15.2024.04.25}, \texttt{t15.2024.04.28}), which our data loading pipeline handles gracefully by creating empty datasets for missing files.
+
+% ============================================================
+% 3. METHODOLOGY
+% ============================================================
+\section{Methodology}
+
+Our approach follows a three-phase pipeline: \textbf{Signal Processing}, \textbf{Model Architecture}, and \textbf{Decoding Strategy}.
+
+\subsection{Phase 1: Signal Processing}
+
+\subsubsection{Gaussian Smoothing}
+
+Neural spiking rates are noisy. To help the model see temporal trends rather than jittery noise, we apply \textbf{1D Gaussian smoothing} along the time dimension for each channel:
+
+\begin{equation}
+    \tilde{x}_{t,c} = \sum_{\tau=-\infty}^{\infty} x_{t+\tau,c} \cdot \frac{1}{\sigma\sqrt{2\pi}} e^{-\frac{\tau^2}{2\sigma^2}}
+\end{equation}
+
+We use $\sigma = 20$ time bins, implemented via \texttt{scipy.ndimage.gaussian\_filter1d}. This smoothing is applied to all 512 channels independently before training.
+
+\subsubsection{Data Augmentation: SpecAugment}
+
+To prevent overfitting on limited training data, we implement \textbf{SpecAugment}-style augmentation, adapted from automatic speech recognition (ASR). This consists of two complementary strategies:
+
+\textbf{Temporal Masking:} During training, a random 10\% of time steps are set to zero across all channels. This forces the model to be robust to missing temporal information:
+\begin{equation}
+    x_{t,:} = 0 \quad \text{for randomly selected } t \in \{1, \ldots, T\}, \quad |\{t\}| = \lfloor 0.1 \cdot T \rfloor
+\end{equation}
+
+\textbf{Channel Masking:} Similarly, a random 10\% of the 512 feature channels are zeroed out across all time steps. This prevents the model from relying on any single electrode:
+\begin{equation}
+    x_{:,c} = 0 \quad \text{for randomly selected } c \in \{1, \ldots, 512\}, \quad |\{c\}| = \lfloor 0.1 \cdot 512 \rfloor
+\end{equation}
+
+Both masking operations are applied \textbf{only during training}, not during validation or testing.
+
+\subsection{Phase 2: Model Architecture}
+
+\subsubsection{Subject Adapter}
+
+A key challenge with longitudinal neural recordings is \textbf{neural drift} -- the neural signals change day-to-day due to electrode micro-movements, tissue healing, and impedance changes. To address this, we implement a \textbf{Subject Adapter} that applies a trainable per-session linear transformation:
+
+\begin{equation}
+    \hat{x} = x \cdot W_s + b_s, \quad s \in \{0, 1, \ldots, 44\}
+\end{equation}
+
+where $W_s \in \mathbb{R}^{512 \times 512}$ and $b_s \in \mathbb{R}^{512}$ are learnable parameters specific to session $s$. The weight matrices are initialized as identity matrices, and biases as zeros, so the adapter starts as a pass-through and learns correction factors during training.
+
+This approach allows the shared encoder to receive ``aligned'' input regardless of which session the data comes from, effectively calibrating each day's neural signals into a common representational space.
+
+\subsubsection{Conformer Encoder}
+
+The core of our model is a \textbf{Conformer} encoder, an architecture originally developed for ASR that combines the strengths of Convolutional Neural Networks (for local pattern extraction) with Transformers (for global context modeling).
+
+Each Conformer block consists of four modules in sequence:
+
+\begin{equation}
+    y = \text{LayerNorm}\Big(x + \frac{1}{2}\text{FFN}_1(x) + \text{MHSA}(x) + \text{Conv}(x) + \frac{1}{2}\text{FFN}_2(x)\Big)
+\end{equation}
+
+The specific components are:
+
+\textbf{1. Feed-Forward Module (FFN):} Two feed-forward modules with expansion factor 4, using the \textbf{Swish} activation function ($\text{Swish}(x) = x \cdot \sigma(x)$). A half-step residual connection is used (factor of $\frac{1}{2}$).
+
+\textbf{2. Multi-Head Self-Attention (MHSA):} With 4 attention heads. Instead of traditional \texttt{nn.MultiheadAttention}, we use PyTorch's \textbf{scaled dot-product attention} (\texttt{F.scaled\_dot\_product\_attention}), which automatically invokes \textbf{Flash Attention} on supported hardware. This computes attention in memory-efficient blocks rather than materializing the full $T \times T$ attention matrix.
+
+\textbf{3. Convolution Module:} Captures local temporal patterns using:
+\begin{itemize}[itemsep=0.2em]
+    \item Pointwise convolution (expansion)
+    \item GLU activation
+    \item Depthwise convolution (kernel size = 31) for local context
+    \item Batch normalization
+    \item Swish activation
+    \item Pointwise convolution (projection)
+\end{itemize}
+
+\textbf{4. Output Projection:} A linear layer maps the encoder dimension to 41 phoneme classes, followed by \textbf{log-softmax} to produce log-probabilities.
+
+\begin{table}[H]
+\centering
+\caption{Model Architecture Hyperparameters}
+\renewcommand{\arraystretch}{1.3}
+\begin{tabular}{lc}
+    \toprule
+    \textbf{Hyperparameter} & \textbf{Value} \\
+    \midrule
+    Input dimension & 512 \\
+    Encoder dimension & 256 \\
+    Number of Conformer layers & 4 \\
+    Number of attention heads & 4 \\
+    Convolution kernel size & 31 \\
+    FFN expansion factor & 4 \\
+    Dropout rate & 0.1 \\
+    Output classes & 41 \\
+    Total parameters & 17,000,489 \\
+    \bottomrule
+\end{tabular}
+\label{tab:architecture}
+\end{table}
+
+\subsection{Phase 3: Decoding Strategy}
+
+\subsubsection{CTC Loss}
+
+We use \textbf{Connectionist Temporal Classification (CTC)} loss for training, which handles the alignment problem between variable-length input sequences and variable-length target phoneme sequences without requiring explicit frame-level alignment labels.
+
+The CTC loss marginalizes over all possible alignments $\pi$ between input frames and target labels:
+
+\begin{equation}
+    \mathcal{L}_{\text{CTC}} = -\log P(y \mid x) = -\log \sum_{\pi \in \mathcal{B}^{-1}(y)} \prod_{t=1}^{T} p(\pi_t \mid x_t)
+\end{equation}
+
+where $\mathcal{B}^{-1}(y)$ is the set of all valid CTC paths that collapse to target $y$, and the \texttt{blank} token (ID = 0) is used to handle repeated characters and silence. We set \texttt{zero\_infinity=True} to handle edge cases where the loss becomes infinite.
+
+\subsubsection{Greedy Decoder}
+
+The baseline decoding strategy simply takes the most probable phoneme at each time step, then collapses consecutive duplicates and removes blank tokens:
+
+\begin{equation}
+    \hat{y} = \mathcal{B}\left(\arg\max_{c} p(c \mid x_t) \;\; \forall \; t\right)
+\end{equation}
+
+\subsubsection{CTC Beam Search Decoder}
+
+We implement a \textbf{CTC Prefix Beam Search} decoder that maintains the top-$K$ hypotheses (beams) at each time step, significantly improving upon greedy decoding.
+
+For each time step $t$, the algorithm:
+\begin{enumerate}
+    \item Extends each existing beam with every possible phoneme class.
+    \item Handles the CTC blank token (prefix stays the same).
+    \item Handles repeat characters (can only extend via blank path).
+    \item Prunes to keep only the top $K$ beams by cumulative log-probability.
+\end{enumerate}
+
+We use a beam width of $K = 10$.
+
+% ============================================================
+% 4. TRAINING
+% ============================================================
+\section{Training Procedure}
+
+\subsection{GPU Optimizations}
+
+Training was performed on an \textbf{NVIDIA Blackwell RTX 5060 Ti} GPU with 16GB VRAM. To fit the model and data within this memory budget, we employed several optimizations:
+
+\textbf{1. BFloat16 Mixed Precision Training:} Native to Blackwell architecture, BFloat16 uses half the memory of FP32 while maintaining the dynamic range needed for stable training. We use PyTorch's \texttt{torch.amp.autocast} with \texttt{GradScaler} for automatic loss scaling.
+
+\textbf{2. Gradient Checkpointing:} Rather than storing all intermediate activations for backpropagation, gradient checkpointing recomputes them during the backward pass. This trades approximately 20\% additional computation time for 60--70\% VRAM savings -- critical for fitting 4 Conformer layers with sequence lengths up to several hundred time steps.
+
+\textbf{3. Flash Attention:} By using \texttt{F.scaled\_dot\_product\_attention}, the self-attention mechanism avoids materializing the full $T \times T$ attention matrix (which would require a 2.8GB allocation for long sequences). Instead, attention is computed in memory-efficient blocks.
+
+\textbf{4. Memory Management:} We set \texttt{PYTORCH\_CUDA\_ALLOC\_CONF=expandable\_segments:True} to reduce CUDA memory fragmentation, and explicitly clear the GPU cache with \texttt{torch.cuda.empty\_cache()} before training.
+
+\subsection{Optimizer and Hyperparameters}
+
+\begin{table}[H]
+\centering
+\caption{Training Hyperparameters}
+\renewcommand{\arraystretch}{1.3}
+\begin{tabular}{lc}
+    \toprule
+    \textbf{Parameter} & \textbf{Value} \\
+    \midrule
+    Optimizer & AdamW \\
+    Learning rate & $1 \times 10^{-3}$ \\
+    Batch size & 8 \\
+    Epochs & 5 \\
+    Precision & BFloat16 \\
+    Gradient clipping & Via GradScaler \\
+    NaN/Inf handling & Skip affected batches \\
+    Smoothing $\sigma$ & 20 \\
+    Temporal mask \% & 10\% \\
+    Channel mask \% & 10\% \\
+    \bottomrule
+\end{tabular}
+\label{tab:training}
+\end{table}
+
+\subsection{Training Loop}
+
+Each epoch proceeds as follows:
+\begin{enumerate}
+    \item \textbf{Forward pass:} Input features are passed through the Subject Adapter and Conformer Encoder under BFloat16 autocast.
+    \item \textbf{CTC Loss:} Computed between the predicted log-probabilities (permuted to $[T, B, C]$) and target phoneme sequences, using input and target lengths for proper masking.
+    \item \textbf{NaN/Inf Skip:} If the loss is NaN or infinite (which can occur with CTC on edge cases), the batch is skipped.
+    \item \textbf{Backward pass:} Gradients are computed using the \texttt{GradScaler} for mixed precision stability.
+    \item \textbf{Validation:} After each epoch, the model is evaluated on the validation set using greedy decoding to compute WER.
+\end{enumerate}
+
+% ============================================================
+% 5. RESULTS
+% ============================================================
+\section{Results}
+
+\subsection{Training and Validation Loss}
+
+Figure~\ref{fig:loss} shows the training and validation loss curves over 5 epochs. Both losses decrease rapidly in the first 2 epochs, with convergence observed by \textbf{Epoch 3}. The training loss continues to decrease marginally in later epochs while the validation loss begins to increase, indicating the onset of overfitting.
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.65\textwidth]{image.png}
+    \caption{Training and Validation Loss over 5 epochs. Both losses converge by Epoch 3, after which validation loss begins to increase, indicating overfitting.}
+    \label{fig:loss}
+\end{figure}
+
+\subsection{Word Error Rate}
+
+Figure~\ref{fig:wer} shows the WER progression across epochs. The WER drops dramatically from 95.04\% at Epoch 1 to a minimum of \textbf{72.19\% at Epoch 3}, representing a 22.85 percentage-point improvement. After Epoch 3, the WER increases, confirming the overfitting behavior observed in the loss curves.
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.65\textwidth]{image2.png}
+    \caption{Word Error Rate (WER) over 5 epochs. Best WER of 72.19\% is achieved at Epoch 3, after which overfitting causes degradation.}
+    \label{fig:wer}
+\end{figure}
+
+\subsection{Detailed Results}
+
+\begin{table}[H]
+\centering
+\caption{Training Results per Epoch}
+\renewcommand{\arraystretch}{1.3}
+\begin{tabular}{cccc}
+    \toprule
+    \textbf{Epoch} & \textbf{Train Loss} & \textbf{Val Loss} & \textbf{WER} \\
+    \midrule
+    1 & $-0.268$ & $-0.331$ & 95.04\% \\
+    2 & $-0.279$ & $-0.336$ & 82.65\% \\
+    \textbf{3} & $\mathbf{-0.280}$ & $\mathbf{-0.337}$ & \textbf{72.19\%} \\
+    4 & $-0.281$ & $-0.330$ & 72.74\% \\
+    5 & $-0.282$ & $-0.330$ & 76.21\% \\
+    \bottomrule
+\end{tabular}
+\label{tab:results}
+\end{table}
+
+\subsection{Greedy vs.\ Beam Search Comparison}
+
+We compared the greedy decoder against the CTC Beam Search decoder (beam width = 10) on the validation set after training:
+
+\begin{table}[H]
+\centering
+\caption{Decoding Strategy Comparison}
+\renewcommand{\arraystretch}{1.3}
+\begin{tabular}{lc}
+    \toprule
+    \textbf{Decoder} & \textbf{WER} \\
+    \midrule
+    Greedy & 76.21\% \\
+    Beam Search ($K=10$) & 76.76\% \\
+    \bottomrule
+\end{tabular}
+\label{tab:decoder_comparison}
+\end{table}
+
+The beam search decoder provides \textbf{no improvement} over greedy decoding and in fact performs slightly worse ($+0.55\%$). This is expected: without a language model to guide the beam search, maintaining multiple hypotheses offers no advantage over simply taking the most likely phoneme at each step. The beam search decoder becomes effective only when combined with a language model (e.g., KenLM n-gram model) that can score hypotheses based on linguistic plausibility.
+
+% ============================================================
+% 6. ANALYSIS
+% ============================================================
+\section{Analysis and Discussion}
+
+\subsection{Interpreting the 72\% WER}
+
+A WER of 72.19\% may appear high, but it is important to understand that this represents the performance of a \textbf{pure acoustic model without any language modeling}. In speech recognition, the acoustic model alone is responsible for mapping input features to phoneme probabilities -- it does not have access to linguistic knowledge about valid words or grammatical structures.
+
+In traditional and neural ASR systems, the acoustic model typically achieves phoneme error rates (PER) of 20--30\% before language model integration reduces WER to single digits. Our result of 72\% WER (which is measured at the word level, a stricter metric than PER) is consistent with a model trained from scratch on limited data without pretrained weights.
+
+\subsection{Overfitting Analysis}
+
+The model achieves its best performance at Epoch 3 and then begins to overfit. Contributing factors include:
+
+\begin{itemize}
+    \item \textbf{Limited training data:} 8,072 trials is relatively small for training a 17M-parameter model.
+    \item \textbf{No learning rate scheduling:} A constant learning rate of $10^{-3}$ may be too aggressive in later epochs.
+    \item \textbf{No regularization beyond dropout:} Only dropout (0.1) and SpecAugment are used for regularization.
+\end{itemize}
+
+\subsection{Subject Adapter Effectiveness}
+
+The Subject Adapter is critical for handling the 45 different recording sessions. Without it, the model would need to learn a single mapping that works across all sessions despite neural drift. The adapter adds $45 \times (512^2 + 512) \approx 11.8M$ parameters (about 69\% of total parameters), but this is justified by the significant inter-session variability in neural signals.
+
+\subsection{Why Beam Search Did Not Help}
+
+The beam search decoder performs equivalently to greedy decoding because:
+
+\begin{enumerate}
+    \item \textbf{No language model constraint:} Without an LM, all phoneme sequences are equally ``valid'' to the decoder. The beam search simply explores more paths through this unconstrained space.
+    \item \textbf{CTC spike patterns:} CTC models tend to produce ``spiky'' output distributions where one phoneme has very high probability at each time step. In this regime, beam search and greedy decoding converge to similar results.
+\end{enumerate}
+
+% ============================================================
+% 7. FUTURE WORK
+% ============================================================
+\section{Future Work and Improvements}
+
+Based on our analysis and insights from winning solutions in previous Brain-to-Text competitions, we identify several avenues for improvement:
+
+\subsection{Language Model Integration}
+
+The most impactful next step is integrating a language model into the decoding pipeline:
+
+\textbf{1. KenLM 4-gram:} Train a 4-gram language model on a large text corpus and integrate it with the beam search decoder via the \texttt{pyctcdecode} library. Expected to reduce WER by 40--50 percentage points.
+
+\textbf{2. LLM Rescoring:} Take the top-$N$ hypotheses from beam search and rescore them using a large language model (e.g., Llama 3.1 8B or Mistral 7B). The LLM can correct semantic errors that n-gram models miss.
+
+\subsection{Training Improvements}
+
+\begin{itemize}
+    \item \textbf{More training epochs} (20--50) with \textbf{cosine annealing} learning rate schedule.
+    \item \textbf{K-Fold cross-validation} (5 folds) for more robust training and ensemble diversity.
+    \item \textbf{Gradient accumulation} to simulate larger effective batch sizes.
+\end{itemize}
+
+\subsection{Architecture Enhancements}
+
+\begin{itemize}
+    \item \textbf{Mamba blocks:} For long-range co-articulation modeling with linear computational complexity.
+    \item \textbf{Bidirectional GRU} layers alongside the Conformer for additional temporal stability.
+    \item \textbf{Transfer learning} from pretrained ASR models or previous Brain-to-Text datasets.
+\end{itemize}
+
+\subsection{Inference Improvements}
+
+\begin{itemize}
+    \item \textbf{Test-Time Augmentation (TTA):} Average predictions over augmented versions of each test sample.
+    \item \textbf{Ensemble averaging:} Combine logits from multiple models (trained on different folds) before decoding.
+\end{itemize}
+
+% ============================================================
+% 8. CONCLUSIONS
+% ============================================================
+\section{Conclusions}
+
+In this project, we developed a neural speech decoding system for the Brain-to-Text '25 competition that maps intracortical neural signals to text. Our approach combines a \textbf{Conformer encoder} with a \textbf{Subject Adapter} to handle neural drift across 45 recording sessions, trained using CTC loss with GPU-optimized techniques including Flash Attention, gradient checkpointing, and BFloat16 mixed precision.
+
+Our key findings and contributions are:
+
+\begin{enumerate}
+    \item The Conformer + Subject Adapter architecture achieves a best WER of \textbf{72.19\%} at Epoch 3, demonstrating that our acoustic model successfully learns neural-to-phoneme mappings from scratch without any pretrained weights.
+    \item \textbf{Language model integration is essential} for competitive WER. Without an LM, beam search provides no advantage over greedy decoding.
+    \item GPU optimizations (Flash Attention, gradient checkpointing, BFloat16) enable training a 17M-parameter model on a 16GB GPU.
+    \item \textbf{Neural drift} across sessions is a significant challenge, addressed by our trainable per-session adapter layer.
+    \item The model begins overfitting after 3 epochs, suggesting the need for more aggressive regularization, learning rate scheduling, and potentially more training data.
+\end{enumerate}
+
+The path to single-digit WER requires language model integration (KenLM + LLM rescoring), ensemble methods, and extended training with better regularization -- all of which represent promising directions for future work that would build directly on our acoustic model foundation.
+
+% ============================================================
+% REFERENCES
+% ============================================================
+\section*{References}
+
+\begin{enumerate}[label={[\arabic*]}]
+    \item Willett, F.R., Kunz, E.M., Fan, C., et al. (2023). ``A high-performance speech neuroprosthesis.'' \textit{Nature}, 620, 1031--1036.
+    \item Gulati, A., Qin, J., Chiu, C.C., et al. (2020). ``Conformer: Convolution-augmented Transformer for speech recognition.'' \textit{Interspeech 2020}.
+    \item Graves, A., Fern\'{a}ndez, S., Gomez, F., Schmidhuber, J. (2006). ``Connectionist temporal classification: Labelling unsegmented sequence data with recurrent neural networks.'' \textit{ICML 2006}.
+    \item Park, D.S., Chan, W., Zhang, Y., et al. (2019). ``SpecAugment: A simple data augmentation method for automatic speech recognition.'' \textit{Interspeech 2019}.
+    \item Dao, T., Fu, D.Y., Ermon, S., Rudra, A., R\'{e}, C. (2022). ``FlashAttention: Fast and memory-efficient exact attention with IO-awareness.'' \textit{NeurIPS 2022}.
+    \item Heafield, K. (2011). ``KenLM: Faster and smaller language model queries.'' \textit{Proceedings of the 6th Workshop on Statistical Machine Translation}.
+    \item Brain-to-Text '25 Benchmark. \url{https://www.kaggle.com/competitions/brain-to-text-25}.
+\end{enumerate}
+
+\end{document}
