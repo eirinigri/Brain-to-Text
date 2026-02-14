@@ -22,19 +22,20 @@ TRAINING IMPROVEMENTS:
 DECODING PIPELINE:
   Acoustic logits → KenLM 4-gram beam search → LLM rescoring (Llama/GPT-2)
 
-INFERENCE:
+INFERENCE (IMPROVED FOR LOWEST WER):
   - K-fold logit averaging (ensemble)
-  - Test-Time Augmentation (TTA with 5 sigmas)
-  - Domain-specific KenLM integration
-  - N-best LLM rescoring
-
-Expected WER: ~3-6% with all components active
+  - Test-Time Augmentation (TTA): pool candidates across multiple sigmas
+  - KenLM integration via pyctcdecode
+  - Competition-style candidate pooling + dedupe + selection
+  - Optional LLM scoring only on top-K candidates for speed
+  - Report-ready plots saved to OUTPUT_DIR
 
 Run: python Enhanced_Brain_to_Text.py
 """
 
 import os
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
 
 import gc, copy, math, json, sys, time
 import h5py
@@ -62,10 +63,10 @@ from sklearn.model_selection import KFold
 
 class CFG:
     # --- Paths (update these for your environment) ---
-    DATA_DIR = r"/mnt/data_ssd/ai_workspace/venv_torch/t15_copyTask_neuralData/hdf5_data_final"
-    PRETRAINED_CHECKPOINT = r"/mnt/data_ssd/ai_workspace/venv_torch/t15_pretrained_rnn_baseline/t15_pretrained_rnn_baseline/checkpoint/best_checkpoint"
-    OUTPUT_DIR = r"/mnt/data_ssd/ai_workspace/venv_torch/enhanced_checkpoints"
-    KENLM_PATH = None  # Set to path of .arpa/.bin file if available
+    DATA_DIR = r"/Users/eirinigriniezaki/Desktop/Brain-to-Text/t15_copyTask_neuralData/hdf5_data_final"
+    PRETRAINED_CHECKPOINT = r"/Users/eirinigriniezaki/Desktop/Brain-to-Text/t15_pretrained_rnn_baseline/t15_pretrained_rnn_baseline/checkpoint/best_checkpoint"
+    OUTPUT_DIR = r"/Users/eirinigriniezaki/Desktop/Brain-to-Text/enhanced_checkpoints"
+    KENLM_PATH = r"/Users/eirinigriniezaki/Desktop/Brain-to-Text/lm.arpa"
 
     # --- Pretrained GRU Architecture (must match checkpoint) ---
     INPUT_DIM = 512
@@ -96,6 +97,8 @@ class CFG:
     WEIGHT_DECAY = 0.01
     PATIENCE = 7
     WARMUP_EPOCHS = 3
+    TRAIN_DEBUG = True     # Print target/output length diagnostics each epoch
+    FAIL_FAST_ON_BAD_LOSS = True
 
     # --- K-Fold Ensemble ---
     N_FOLDS = 3
@@ -108,15 +111,17 @@ class CFG:
     CHANNEL_MASK_PCT = 0.1
 
     # --- Decoding ---
-    BEAM_WIDTH = 100      # Wide beam for best quality
+    BEAM_WIDTH = 30       # Practical for Python fallback beam search
     USE_LM = True
+    USE_PYCTCDECODE = False  # Multi-character phoneme labels are incompatible with pyctcdecode token assumptions
     LM_ALPHA = 0.5        # KenLM weight
     LM_BETA = 1.5         # Word insertion bonus
-    USE_LLM_RESCORE = True
+    USE_LLM_RESCORE = False  # Usually improves phoneme-level WER stability
     LLM_MODEL = "meta-llama/Llama-3.2-1B"  # Llama for rescoring (can also use "gpt2" as fallback)
     LLM_FALLBACK = "gpt2"  # Fallback if Llama not available
     LLM_WEIGHT = 0.3
     N_BEST = 20
+    VAL_USE_BEAM = False  # Greedy validation is faster and avoids decode-backend mismatch during training
 
     # --- TTA ---
     USE_TTA = True
@@ -216,88 +221,303 @@ class BrainDataset(Dataset):
 
         try:
             with h5py.File(self.file_path, "r") as f:
-                self.trial_keys = sorted(list(f.keys()))
-        except FileNotFoundError:
+                self.trial_keys = list(f.keys())
+        except Exception as e:
+            print(f"Error reading {self.file_path}: {e}")
             self.trial_keys = []
 
     def __len__(self):
         return len(self.trial_keys)
 
-    def __getitem__(self, idx):
+    def _ensure_file_open(self):
         if self.file is None:
             self.file = h5py.File(self.file_path, "r")
 
-        grp = self.file[self.trial_keys[idx]]
-        x_data = grp["input_features"][:]
+    def __getitem__(self, idx):
+        self._ensure_file_open()
+        key = self.trial_keys[idx]
+        grp = self.file[key]
 
-        # Smooth
-        x_data = smooth_data(x_data, sigma=self.smoothing_sigma)
+        x = grp["input_features"][:].astype(np.float32)
+        x = smooth_data(x, sigma=self.smoothing_sigma)
+        x = augment_neural(x, is_train=self.is_train)
 
-        # Augment
-        x_data = augment_neural(x_data, is_train=self.is_train)
-
-        x = torch.tensor(x_data, dtype=torch.float32)
-
+        # Load labels whenever available (some "test" files can still be labeled locally).
         if "seq_class_ids" in grp:
-            y_data = grp["seq_class_ids"][:]
-            y = torch.tensor(y_data, dtype=torch.long)
+            y = grp["seq_class_ids"][:].astype(np.int64)
+            # Targets are zero-padded to fixed length in this dataset; CTC targets must not include blank(0).
+            y = y[y != 0]
         else:
-            y = torch.tensor([], dtype=torch.long)
+            # Keep unlabeled samples valid for collation while signaling empty transcript.
+            y = np.zeros((0,), dtype=np.int64)
 
-        if self.is_test:
-            return x, y, self.session_id, self.trial_keys[idx]
-        return x, y, self.session_id
+        return (
+            torch.tensor(x, dtype=torch.float32),
+            torch.tensor(y, dtype=torch.long),
+            x.shape[0],
+            len(y),
+            self.session_id,
+        )
 
 def collate_fn(batch):
-    is_test = len(batch[0]) == 4
-    if is_test:
-        xs, ys, sids, keys = zip(*batch)
-    else:
-        xs, ys, sids = zip(*batch)
-        keys = None
+    xs, ys, xlens, ylens, sids = zip(*batch)
+    xs_padded = rnn_utils.pad_sequence(xs, batch_first=True, padding_value=0.0)
+    ys_padded = rnn_utils.pad_sequence(ys, batch_first=True, padding_value=0)
+    return (
+        xs_padded,
+        ys_padded,
+        torch.tensor(xlens, dtype=torch.long),
+        torch.tensor(ylens, dtype=torch.long),
+        torch.tensor(sids, dtype=torch.long),
+    )
 
-    x_lens = torch.tensor([len(x) for x in xs], dtype=torch.long)
-    y_lens = torch.tensor([len(y) for y in ys], dtype=torch.long)
-    sids_t = torch.tensor(sids, dtype=torch.long)
-
-    padded_x = rnn_utils.pad_sequence(xs, batch_first=True, padding_value=0.0)
-    padded_y = rnn_utils.pad_sequence(ys, batch_first=True, padding_value=0)
-
-    result = (padded_x, padded_y, x_lens, y_lens, sids_t)
-    return (*result, keys) if is_test else result
-
-def load_split(split='train', sigma=None):
-    """Load all sessions for a given split."""
-    sigma = sigma if sigma is not None else CFG.SMOOTHING_SIGMA
+def load_split(split_name):
+    """Load split (train/val/test) across all sessions."""
     datasets = []
-    data_dir = CFG.DATA_DIR
-
     for session in SESSIONS:
-        sp = os.path.join(data_dir, session)
-        if not os.path.isdir(sp):
+        session_dir = os.path.join(CFG.DATA_DIR, session)
+        if not os.path.exists(session_dir):
             continue
-        fp = os.path.join(sp, f"data_{split}.hdf5")
-        sid = SESSION_TO_ID[session]
 
+        file_name = f"data_{split_name}.hdf5"
+        hdf5_path = os.path.join(session_dir, file_name)
+        if not os.path.exists(hdf5_path):
+            continue
+
+        sid = SESSION_TO_ID.get(session, 0)
         ds = BrainDataset(
-            fp, sid,
-            is_test=(split == 'test'),
-            is_train=(split == 'train'),
-            smoothing_sigma=sigma
+            hdf5_path,
+            session_id=sid,
+            is_test=(split_name == "test"),
+            is_train=(split_name == "train"),
+            smoothing_sigma=CFG.SMOOTHING_SIGMA,
         )
         if len(ds) > 0:
             datasets.append(ds)
 
-    return ConcatDataset(datasets) if datasets else None
+    if not datasets:
+        return ConcatDataset([])
+    return ConcatDataset(datasets)
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# MODEL: PRETRAINED GRU DECODER (matches baseline checkpoint exactly)
+# CTC DECODING (GREEDY + BEAM)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def greedy_decode(logits):
+    """Greedy CTC decode."""
+    if isinstance(logits, torch.Tensor):
+        logits = logits.cpu().numpy()
+    tokens = np.argmax(logits, axis=-1)
+    prev = None
+    out = []
+    for t in tokens:
+        if t != prev and t != 0:
+            out.append(TOKEN_MAP.get(int(t), ""))
+        prev = t
+    return " ".join(out)
+
+def ctc_beam_search(logits, beam_width=50):
+    """Simple CTC beam search (fallback if pyctcdecode unavailable)."""
+    if isinstance(logits, torch.Tensor):
+        logits = logits.cpu().numpy()
+
+    # Convert to log-probabilities for numerically sound beam scoring.
+    logits = logits.astype(np.float64)
+    logits = logits - np.logaddexp.reduce(logits, axis=-1, keepdims=True)
+
+    T, C = logits.shape
+    beams = {(tuple(), 0): 0.0}
+    for t in range(T):
+        new_beams = defaultdict(lambda: -1e9)
+        for (prefix, last), score in beams.items():
+            for c in range(C):
+                p = logits[t, c]
+                if c == 0:
+                    new_beams[(prefix, last)] = np.logaddexp(new_beams[(prefix, last)], score + p)
+                else:
+                    if c == last:
+                        new_beams[(prefix, last)] = np.logaddexp(new_beams[(prefix, last)], score + p)
+                    else:
+                        new_prefix = prefix + (c,)
+                        new_beams[(new_prefix, c)] = np.logaddexp(new_beams[(new_prefix, c)], score + p)
+        beams = dict(sorted(new_beams.items(), key=lambda x: x[1], reverse=True)[:beam_width])
+
+    best = max(beams, key=lambda k: beams[k])
+    return " ".join([TOKEN_MAP.get(i, "") for i in best[0]])
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# KENLM LANGUAGE MODEL DECODER
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class LMDecoder:
+    """Beam search decoder with optional KenLM integration via pyctcdecode."""
+
+    def __init__(self):
+        self.decoder = None
+        self._init_decoder()
+
+    def _init_decoder(self):
+        if not CFG.USE_PYCTCDECODE:
+            print("  pyctcdecode disabled for phoneme-token decoding; using internal CTC beam search")
+            return
+
+        # pyctcdecode is designed for character/BPE tokens; this task uses ARPABET-like multi-char phoneme tokens.
+        non_blank_labels = [l for l in DECODER_LABELS if l]
+        has_multi_char_phonemes = any((len(l) > 1 and l != "|") for l in non_blank_labels)
+        if has_multi_char_phonemes:
+            print("  Detected multi-character phoneme labels; skipping pyctcdecode to avoid tokenization mismatch")
+            return
+
+        try:
+            from pyctcdecode import build_ctcdecoder
+
+            if CFG.USE_LM and CFG.KENLM_PATH and os.path.exists(CFG.KENLM_PATH):
+                print(f"  KenLM model: {CFG.KENLM_PATH}")
+                self.decoder = build_ctcdecoder(
+                    labels=DECODER_LABELS,
+                    kenlm_model_path=CFG.KENLM_PATH,
+                    alpha=CFG.LM_ALPHA,
+                    beta=CFG.LM_BETA,
+                )
+            else:
+                # No LM, just beam search
+                self.decoder = build_ctcdecoder(labels=DECODER_LABELS)
+                if CFG.USE_LM and CFG.KENLM_PATH:
+                    print(f"  WARNING: KenLM not found at {CFG.KENLM_PATH}")
+            print("  ✓ pyctcdecode decoder ready")
+        except ImportError:
+            print("  pyctcdecode not installed (pip install pyctcdecode kenlm)")
+            print("  Falling back to Python beam search")
+
+    def decode(self, logits, beam_width=None):
+        """Decode log-probabilities to text."""
+        bw = beam_width or CFG.BEAM_WIDTH
+        if isinstance(logits, torch.Tensor):
+            logits = logits.cpu().numpy()
+
+        if self.decoder is not None:
+            logits64 = logits.astype(np.float64)
+            logits64 = logits64 - logits64.max(axis=-1, keepdims=True)
+            probs = np.exp(logits64)
+            probs = probs / np.clip(probs.sum(axis=-1, keepdims=True), 1e-12, None)
+            return self.decoder.decode(probs, beam_width=bw)
+        else:
+            return ctc_beam_search(logits, beam_width=bw)
+
+    def decode_nbest(self, logits, beam_width=None, n_best=None):
+        """Return N-best hypotheses for LLM rescoring."""
+        bw = beam_width or CFG.BEAM_WIDTH
+        nb = n_best or CFG.N_BEST
+
+        if isinstance(logits, torch.Tensor):
+            logits = logits.cpu().numpy()
+
+        if self.decoder is not None:
+            try:
+                logits64 = logits.astype(np.float64)
+                logits64 = logits64 - logits64.max(axis=-1, keepdims=True)
+                probs = np.exp(logits64)
+                probs = probs / np.clip(probs.sum(axis=-1, keepdims=True), 1e-12, None)
+                beams = self.decoder.decode_beams(probs, beam_width=bw)
+                results = []
+                for b in beams[:nb]:
+                    text = b[0]
+                    score = (b[3] + b[4]) if len(b) > 4 else b[3] if len(b) > 3 else 0.0
+                    results.append((text, score))
+                return results
+            except Exception:
+                return [(self.decode(logits, bw), 0.0)]
+        else:
+            return [(ctc_beam_search(logits, beam_width=bw), 0.0)]
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# LLM RESCORER (Llama 3.2 1B / GPT-2 fallback)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class LLMRescorer:
+    """Rescore N-best hypotheses using a pretrained LLM."""
+
+    def __init__(self):
+        self.model = None
+        self.tokenizer = None
+        self.device = CFG.DEVICE
+        self.model_name = None
+        self._init_llm()
+
+    def _init_llm(self):
+        if not CFG.USE_LLM_RESCORE:
+            print("  LLM rescoring disabled")
+            return
+
+        try:
+            from transformers import AutoModelForCausalLM, AutoTokenizer
+        except ImportError:
+            print("  transformers not installed (pip install transformers)")
+            return
+
+        # Try primary model, then fallback
+        for model_name in [CFG.LLM_MODEL, CFG.LLM_FALLBACK]:
+            try:
+                print(f"  Loading LLM: {model_name}...")
+                self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+                self.model = AutoModelForCausalLM.from_pretrained(
+                    model_name,
+                    torch_dtype=torch.float16 if self.device == "cuda" else torch.float32,
+                    device_map="auto" if self.device == "cuda" else None,
+                    low_cpu_mem_usage=True,
+                )
+                if self.device != "cuda":
+                    self.model = self.model.to(self.device)
+                self.model.eval()
+
+                if self.tokenizer.pad_token is None:
+                    self.tokenizer.pad_token = self.tokenizer.eos_token
+
+                self.model_name = model_name
+                print(f"  ✓ LLM loaded: {model_name}")
+                return
+            except Exception as e:
+                print(f"  Failed to load {model_name}: {str(e)[:100]}")
+
+        print("  WARNING: No LLM available. Rescoring disabled.")
+        self.model = None
+
+    def score(self, text):
+        """Compute log-likelihood of text."""
+        if self.model is None or not text.strip():
+            return 0.0
+        try:
+            inputs = self.tokenizer(text, return_tensors="pt", truncation=True, max_length=512)
+            inputs = {k: v.to(self.device) for k, v in inputs.items()}
+            with torch.no_grad():
+                outputs = self.model(**inputs, labels=inputs["input_ids"])
+            return -outputs.loss.item()  # Higher = more likely
+        except Exception:
+            return 0.0
+
+    def rescore(self, hypotheses):
+        """Rescore N-best list → return best text."""
+        if self.model is None or not hypotheses:
+            return hypotheses[0][0] if hypotheses else ""
+
+        best_text, best_score = "", float('-inf')
+        for text, beam_score in hypotheses:
+            llm_score = self.score(text)
+            combined = beam_score + CFG.LLM_WEIGHT * llm_score
+            if combined > best_score:
+                best_score = combined
+                best_text = text
+
+        return best_text
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# MODEL: PRETRAINED GRU DECODER (from baseline)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class GRUDecoder(nn.Module):
     """
     Exact replica of the pretrained baseline GRUDecoder.
-    Architecture (from training_log):
+    Architecture (from checkpoint):
       day_weights:     ParameterList of 45 × [512, 512] matrices
       day_biases:      ParameterList of 45 × [1, 512] vectors
       day_layer_activation: Softsign()
@@ -305,8 +525,9 @@ class GRUDecoder(nn.Module):
       gru:             GRU(7168, 768, num_layers=5, batch_first=True, dropout=0.4)
       out:             Linear(768, 41)
     """
-    def __init__(self, n_days=45):
+    def __init__(self, n_days=CFG.N_SESSIONS):
         super().__init__()
+        self.n_days = n_days
 
         # Day adapter (ParameterList to match checkpoint keys exactly)
         self.day_weights = nn.ParameterList([
@@ -318,61 +539,60 @@ class GRUDecoder(nn.Module):
         self.day_layer_activation = nn.Softsign()
         self.day_layer_dropout = nn.Dropout(CFG.DAY_DROPOUT)
 
-        # GRU with patch embedding
+        # GRU with patch embedding — raw patches go straight in (no projection)
         gru_input_size = CFG.INPUT_DIM * CFG.PATCH_SIZE  # 512 * 14 = 7168
         self.gru = nn.GRU(
             input_size=gru_input_size,
             hidden_size=CFG.GRU_HIDDEN,
             num_layers=CFG.GRU_LAYERS,
             batch_first=True,
-            dropout=CFG.GRU_DROPOUT
+            dropout=CFG.GRU_DROPOUT,
         )
         self.out = nn.Linear(CFG.GRU_HIDDEN, CFG.OUTPUT_DIM)
 
-    def forward(self, x, day_ids):
+    def get_output_length(self, input_len):
+        """Compute output length after patching."""
+        if input_len < CFG.PATCH_SIZE:
+            return 1
+        return 1 + (input_len - CFG.PATCH_SIZE) // CFG.PATCH_STRIDE
+
+    def forward(self, x, session_ids):
         """
-        Args:
-            x: [B, T, 512] neural features
-            day_ids: [B] session indices or single int
-        Returns:
-            [B, T', 41] log-probabilities
+        x: [B, T, 512] neural features
+        session_ids: [B] session indices
+        Returns: [B, T', 41] logits (NOT log-softmax; CTC loss does its own log_softmax)
         """
         B, T, D = x.shape
 
         # Day adapter: per-sample linear transform
-        if isinstance(day_ids, torch.Tensor):
-            day_list = day_ids.tolist()
-        elif isinstance(day_ids, int):
-            day_list = [day_ids] * B
+        if isinstance(session_ids, torch.Tensor):
+            day_list = session_ids.tolist()
+        elif isinstance(session_ids, int):
+            day_list = [session_ids] * B
         else:
-            day_list = list(day_ids)
+            day_list = list(session_ids)
 
         adapted = []
         for i, d in enumerate(day_list):
+            d = max(0, min(d, self.n_days - 1))
             a = torch.matmul(x[i], self.day_weights[d]) + self.day_biases[d]
             adapted.append(a)
         x = torch.stack(adapted)
         x = self.day_layer_dropout(self.day_layer_activation(x))
 
         # Patch embedding: unfold time dimension
-        # [B, T, D] → [B, n_patches, D * patch_size]
         if T >= CFG.PATCH_SIZE:
             patches = x.unfold(1, CFG.PATCH_SIZE, CFG.PATCH_STRIDE)  # [B, n_patches, D, patch_size]
             patches = patches.permute(0, 1, 3, 2).reshape(B, patches.size(1), -1)  # [B, n_patches, D*patch_size]
         else:
-            # Pad if too short
             pad_len = CFG.PATCH_SIZE - T
             x = F.pad(x, (0, 0, 0, pad_len))
             patches = x.reshape(B, 1, -1)
 
         # GRU
         out, _ = self.gru(patches)
-        out = self.out(out)
-        return F.log_softmax(out, dim=-1)
-
-    def get_output_length(self, input_length):
-        """Calculate output sequence length after patch embedding."""
-        return max(1, (input_length - CFG.PATCH_SIZE) // CFG.PATCH_STRIDE + 1)
+        logits = self.out(out)
+        return logits
 
 def load_pretrained_gru(checkpoint_path=None):
     """Load the pretrained GRU model from the baseline checkpoint."""
@@ -422,31 +642,25 @@ def load_pretrained_gru(checkpoint_path=None):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class SubjectAdapter(nn.Module):
-    def __init__(self, input_dim, num_sessions):
+    def __init__(self, in_dim=CFG.INPUT_DIM, out_dim=CFG.CONFORMER_DIM):
         super().__init__()
-        self.weight = nn.Parameter(torch.stack([torch.eye(input_dim) for _ in range(num_sessions)]))
-        self.bias = nn.Parameter(torch.zeros(num_sessions, input_dim))
+        self.fc = nn.Linear(in_dim, out_dim)
 
-    def forward(self, x, session_ids):
-        w = self.weight[session_ids]
-        b = self.bias[session_ids].unsqueeze(1)
-        return torch.bmm(x, w) + b
-
-class Swish(nn.Module):
     def forward(self, x):
-        return x * torch.sigmoid(x)
+        return self.fc(x)
 
 class FeedForwardModule(nn.Module):
-    def __init__(self, dim, expansion_factor=4, dropout=0.1):
+    def __init__(self, dim, expansion=4, dropout=0.1):
         super().__init__()
         self.net = nn.Sequential(
             nn.LayerNorm(dim),
-            nn.Linear(dim, dim * expansion_factor),
-            Swish(),
+            nn.Linear(dim, dim * expansion),
+            nn.SiLU(),
             nn.Dropout(dropout),
-            nn.Linear(dim * expansion_factor, dim),
+            nn.Linear(dim * expansion, dim),
             nn.Dropout(dropout),
         )
+
     def forward(self, x):
         return self.net(x)
 
@@ -454,320 +668,153 @@ class ConvolutionModule(nn.Module):
     def __init__(self, dim, kernel_size=31, dropout=0.1):
         super().__init__()
         self.layer_norm = nn.LayerNorm(dim)
-        self.pw1 = nn.Conv1d(dim, dim * 2, 1)
+        self.pointwise_conv1 = nn.Conv1d(dim, 2 * dim, kernel_size=1)
         self.glu = nn.GLU(dim=1)
-        self.dw = nn.Conv1d(dim, dim, kernel_size, padding=(kernel_size - 1) // 2, groups=dim)
-        self.bn = nn.BatchNorm1d(dim)
-        self.swish = Swish()
-        self.pw2 = nn.Conv1d(dim, dim, 1)
-        self.drop = nn.Dropout(dropout)
+        self.depthwise_conv = nn.Conv1d(
+            dim, dim, kernel_size=kernel_size, padding=kernel_size // 2, groups=dim
+        )
+        self.batch_norm = nn.BatchNorm1d(dim)
+        self.pointwise_conv2 = nn.Conv1d(dim, dim, kernel_size=1)
+        self.dropout = nn.Dropout(dropout)
+        self.act = nn.SiLU()
 
     def forward(self, x):
-        out = self.layer_norm(x).transpose(1, 2)
-        out = self.glu(self.pw1(out))
-        out = self.dw(out)
-        out = self.swish(self.bn(out))
-        out = self.drop(self.pw2(out)).transpose(1, 2)
+        x = self.layer_norm(x)
+        x = x.transpose(1, 2)
+        x = self.pointwise_conv1(x)
+        x = self.glu(x)
+        x = self.depthwise_conv(x)
+        x = self.batch_norm(x)
+        x = self.act(x)
+        x = self.pointwise_conv2(x)
+        x = self.dropout(x)
+        x = x.transpose(1, 2)
+        return x
+
+class MultiHeadSelfAttention(nn.Module):
+    def __init__(self, dim, heads=4, dropout=0.1):
+        super().__init__()
+        self.layer_norm = nn.LayerNorm(dim)
+        self.attn = nn.MultiheadAttention(dim, heads, dropout=dropout, batch_first=True)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        x_norm = self.layer_norm(x)
+        out, _ = self.attn(x_norm, x_norm, x_norm, need_weights=False)
+        out = self.dropout(out)
         return out
 
 class ConformerBlock(nn.Module):
-    def __init__(self, dim, n_head, conv_kernel=31, dropout=0.1):
+    def __init__(self, dim, heads, kernel_size, dropout):
         super().__init__()
         self.ff1 = FeedForwardModule(dim, dropout=dropout)
-        self.attn_norm = nn.LayerNorm(dim)
-        self.dropout_p = dropout
-        self.conv = ConvolutionModule(dim, kernel_size=conv_kernel, dropout=dropout)
+        self.mhsa = MultiHeadSelfAttention(dim, heads=heads, dropout=dropout)
+        self.conv = ConvolutionModule(dim, kernel_size=kernel_size, dropout=dropout)
         self.ff2 = FeedForwardModule(dim, dropout=dropout)
-        self.final_norm = nn.LayerNorm(dim)
-        self.drop = nn.Dropout(dropout)
+        self.ln = nn.LayerNorm(dim)
 
     def forward(self, x):
         x = x + 0.5 * self.ff1(x)
-        residual = x
-        x_n = self.attn_norm(x)
-        attn = F.scaled_dot_product_attention(x_n, x_n, x_n,
-                                               dropout_p=self.dropout_p if self.training else 0.0,
-                                               is_causal=False)
-        x = residual + self.drop(attn)
+        x = x + self.mhsa(x)
         x = x + self.conv(x)
         x = x + 0.5 * self.ff2(x)
-        return self.final_norm(x)
-
-class ConformerEncoder(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.input_proj = nn.Linear(CFG.INPUT_DIM, CFG.CONFORMER_DIM)
-        self.layers = nn.ModuleList([
-            ConformerBlock(CFG.CONFORMER_DIM, CFG.CONFORMER_HEADS,
-                          CFG.CONFORMER_KERNEL, CFG.CONFORMER_DROPOUT)
-            for _ in range(CFG.CONFORMER_LAYERS)
-        ])
-        self.output_proj = nn.Linear(CFG.CONFORMER_DIM, CFG.OUTPUT_DIM)
-
-    def forward(self, x):
-        x = self.input_proj(x)
-        for layer in self.layers:
-            x = checkpoint(layer, x, use_reentrant=False)
-        return F.log_softmax(self.output_proj(x), dim=2)
+        return self.ln(x)
 
 class ConformerModel(nn.Module):
     def __init__(self):
         super().__init__()
-        self.adapter = SubjectAdapter(CFG.INPUT_DIM, CFG.N_SESSIONS)
-        self.encoder = ConformerEncoder()
+        self.adapter = SubjectAdapter(CFG.INPUT_DIM, CFG.CONFORMER_DIM)
+        self.layers = nn.ModuleList([
+            ConformerBlock(
+                dim=CFG.CONFORMER_DIM,
+                heads=CFG.CONFORMER_HEADS,
+                kernel_size=CFG.CONFORMER_KERNEL,
+                dropout=CFG.CONFORMER_DROPOUT,
+            ) for _ in range(CFG.CONFORMER_LAYERS)
+        ])
+        self.out = nn.Linear(CFG.CONFORMER_DIM, CFG.OUTPUT_DIM)
 
-    def forward(self, x, session_ids):
-        return self.encoder(self.adapter(x, session_ids))
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# DECODERS
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def greedy_decode(logits, token_map=TOKEN_MAP):
-    """Simple greedy CTC decoder."""
-    ids = torch.argmax(logits, dim=-1)
-    collapsed = torch.unique_consecutive(ids)
-    tokens = [token_map.get(i.item(), "") for i in collapsed if i.item() != 0]
-    return " ".join(tokens)
-
-def ctc_beam_search(log_probs, beam_width=10, blank_id=0):
-    """Pure-Python CTC prefix beam search."""
-    if isinstance(log_probs, torch.Tensor):
-        log_probs = log_probs.cpu().numpy()
-    T, C = log_probs.shape
-    NEG_INF = float('-inf')
-    beams = {(): (0.0, NEG_INF)}
-
-    for t in range(T):
-        new_beams = defaultdict(lambda: (NEG_INF, NEG_INF))
-        for prefix, (pb, pnb) in beams.items():
-            p_total = np.logaddexp(pb, pnb)
-            for c in range(C):
-                p_c = log_probs[t, c]
-                if c == blank_id:
-                    npb, npnb = new_beams[prefix]
-                    new_beams[prefix] = (np.logaddexp(npb, p_total + p_c), npnb)
-                else:
-                    new_prefix = prefix + (c,)
-                    npb, npnb = new_beams[new_prefix]
-                    if prefix and c == prefix[-1]:
-                        npnb = np.logaddexp(npnb, pb + p_c)
-                        opb, opnb = new_beams[prefix]
-                        new_beams[prefix] = (opb, np.logaddexp(opnb, pnb + p_c))
-                    else:
-                        npnb = np.logaddexp(npnb, p_total + p_c)
-                    new_beams[new_prefix] = (npb, npnb)
-        scored = sorted(new_beams.items(), key=lambda x: np.logaddexp(*x[1]), reverse=True)
-        beams = dict(scored[:beam_width])
-
-    if not beams:
-        return ""
-    best = max(beams.keys(), key=lambda k: np.logaddexp(*beams[k]))
-    return " ".join([TOKEN_MAP.get(i, "") for i in best])
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# KENLM LANGUAGE MODEL DECODER
-# ═══════════════════════════════════════════════════════════════════════════════
-
-class LMDecoder:
-    """Beam search decoder with optional KenLM integration via pyctcdecode."""
-
-    def __init__(self):
-        self.decoder = None
-        self._init_decoder()
-
-    def _init_decoder(self):
-        try:
-            from pyctcdecode import build_ctcdecoder
-
-            if CFG.KENLM_PATH and os.path.exists(CFG.KENLM_PATH):
-                print(f"  KenLM model: {CFG.KENLM_PATH}")
-                self.decoder = build_ctcdecoder(
-                    labels=DECODER_LABELS,
-                    kenlm_model_path=CFG.KENLM_PATH,
-                    alpha=CFG.LM_ALPHA,
-                    beta=CFG.LM_BETA,
-                )
-            else:
-                # No LM, just beam search
-                self.decoder = build_ctcdecoder(labels=DECODER_LABELS)
-                if CFG.KENLM_PATH:
-                    print(f"  WARNING: KenLM not found at {CFG.KENLM_PATH}")
-            print("  ✓ pyctcdecode decoder ready")
-        except ImportError:
-            print("  pyctcdecode not installed (pip install pyctcdecode kenlm)")
-            print("  Falling back to Python beam search")
-
-    def decode(self, logits, beam_width=None):
-        """Decode log-probabilities to text."""
-        bw = beam_width or CFG.BEAM_WIDTH
-        if isinstance(logits, torch.Tensor):
-            logits = logits.cpu().numpy()
-
-        if self.decoder is not None:
-            probs = np.exp(logits.astype(np.float64))
-            probs = probs / probs.sum(axis=-1, keepdims=True)  # Ensure valid probabilities
-            return self.decoder.decode(probs, beam_width=bw)
-        else:
-            return ctc_beam_search(logits, beam_width=bw)
-
-    def decode_nbest(self, logits, beam_width=None, n_best=None):
-        """Return N-best hypotheses for LLM rescoring."""
-        bw = beam_width or CFG.BEAM_WIDTH
-        nb = n_best or CFG.N_BEST
-
-        if isinstance(logits, torch.Tensor):
-            logits = logits.cpu().numpy()
-
-        if self.decoder is not None:
-            try:
-                probs = np.exp(logits.astype(np.float64))
-                probs = probs / probs.sum(axis=-1, keepdims=True)
-                beams = self.decoder.decode_beams(probs, beam_width=bw)
-                results = []
-                for b in beams[:nb]:
-                    text = b[0]
-                    score = (b[3] + b[4]) if len(b) > 4 else b[3] if len(b) > 3 else 0.0
-                    results.append((text, score))
-                return results
-            except:
-                return [(self.decode(logits, bw), 0.0)]
-        else:
-            return [(ctc_beam_search(logits, beam_width=bw), 0.0)]
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# LLM RESCORER (Llama 3.2 1B / GPT-2 fallback)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-class LLMRescorer:
-    """Rescore N-best hypotheses using a pretrained LLM."""
-
-    def __init__(self):
-        self.model = None
-        self.tokenizer = None
-        self.device = CFG.DEVICE
-        self.model_name = None
-        self._init_llm()
-
-    def _init_llm(self):
-        if not CFG.USE_LLM_RESCORE:
-            print("  LLM rescoring disabled")
-            return
-
-        try:
-            from transformers import AutoModelForCausalLM, AutoTokenizer
-        except ImportError:
-            print("  transformers not installed (pip install transformers)")
-            return
-
-        # Try primary model, then fallback
-        for model_name in [CFG.LLM_MODEL, CFG.LLM_FALLBACK]:
-            try:
-                print(f"  Loading LLM: {model_name}...")
-                self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-                self.model = AutoModelForCausalLM.from_pretrained(
-                    model_name,
-                    torch_dtype=torch.float16 if self.device == "cuda" else torch.float32,
-                    device_map="auto" if self.device == "cuda" else None,
-                    low_cpu_mem_usage=True,
-                )
-                if self.device != "cuda":
-                    self.model = self.model.to(self.device)
-                self.model.eval()
-
-                if self.tokenizer.pad_token is None:
-                    self.tokenizer.pad_token = self.tokenizer.eos_token
-
-                self.model_name = model_name
-                n_params = sum(p.numel() for p in self.model.parameters()) / 1e6
-                print(f"  ✓ LLM loaded: {model_name} ({n_params:.0f}M params)")
-                return
-            except Exception as e:
-                print(f"  Could not load {model_name}: {e}")
-                continue
-
-        print("  WARNING: No LLM available. Rescoring disabled.")
-
-    def score(self, text):
-        """Compute log-likelihood of text."""
-        if self.model is None or not text.strip():
-            return 0.0
-        try:
-            inputs = self.tokenizer(text, return_tensors="pt", truncation=True, max_length=512)
-            inputs = {k: v.to(self.device) for k, v in inputs.items()}
-            with torch.no_grad():
-                outputs = self.model(**inputs, labels=inputs["input_ids"])
-            return -outputs.loss.item()  # Higher = more likely
-        except:
-            return 0.0
-
-    def rescore(self, hypotheses):
-        """Rescore N-best list → return best text."""
-        if self.model is None or not hypotheses:
-            return hypotheses[0][0] if hypotheses else ""
-
-        best_text, best_score = "", float('-inf')
-        for text, beam_score in hypotheses:
-            llm_score = self.score(text)
-            combined = beam_score + CFG.LLM_WEIGHT * llm_score
-            if combined > best_score:
-                best_score = combined
-                best_text = text
-
-        return best_text
+    def forward(self, x, session_ids=None):
+        x = self.adapter(x)
+        for layer in self.layers:
+            x = layer(x)
+        return self.out(x)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # TRAINING ENGINE
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def warmup_cosine_lr(optimizer, epoch, warmup=3, total=30, lr_min=1e-6):
-    """Apply warmup + cosine annealing LR schedule."""
-    for pg in optimizer.param_groups:
-        base = pg.get('initial_lr', pg['lr'])
-        if epoch < warmup:
-            lr = base * (epoch + 1) / warmup
-        else:
-            progress = (epoch - warmup) / max(total - warmup, 1)
-            lr = lr_min + 0.5 * (base - lr_min) * (1 + math.cos(math.pi * progress))
-        pg['lr'] = lr
-    return optimizer.param_groups[0]['lr']
+def cosine_lr(epoch, total_epochs, base_lr, min_lr):
+    return min_lr + 0.5 * (base_lr - min_lr) * (1 + math.cos(math.pi * epoch / total_epochs))
 
-def train_epoch(model, loader, criterion, optimizer, scaler, epoch):
-    """Train one epoch with gradient accumulation and mixed precision."""
+def train_epoch(model, loader, optimizer, criterion, scaler=None):
     model.train()
     total_loss, n = 0.0, 0
-    use_amp = CFG.DEVICE == "cuda"
-    optimizer.zero_grad()
 
-    pbar = tqdm(loader, desc=f"Epoch {epoch} [Train]", leave=False)
+    pbar = tqdm(loader, desc="[Train]", leave=False)
+    optimizer.zero_grad()
+    accum_steps = 0
+    batches_total = 0
+    batches_empty_target = 0
+    batches_bad_loss = 0
+    tgt_len_sum, out_len_sum, sample_count = 0.0, 0.0, 0
+    tgt_min, tgt_max = 10**9, -1
+    out_min, out_max = 10**9, -1
+
     for step, batch in enumerate(pbar):
+        batches_total += 1
         x, y, x_lens, y_lens, sids = batch[:5]
+
+        # Skip samples without labels (should not happen for train/val, but fail-safe).
+        valid_idx = torch.nonzero(y_lens > 0, as_tuple=False).squeeze(1)
+        if valid_idx.numel() == 0:
+            batches_empty_target += 1
+            continue
+        if valid_idx.numel() < y_lens.numel():
+            x = x.index_select(0, valid_idx)
+            y = y.index_select(0, valid_idx)
+            x_lens = x_lens.index_select(0, valid_idx)
+            y_lens = y_lens.index_select(0, valid_idx)
+            sids = sids.index_select(0, valid_idx)
+
         x = x.to(CFG.DEVICE)
+        y = y.to(CFG.DEVICE)
         sids = sids.to(CFG.DEVICE)
 
+        use_amp = CFG.DEVICE == "cuda"
         if use_amp:
             with autocast('cuda', dtype=torch.bfloat16):
                 logits = model(x, sids)
-                # Compute proper output lengths
-                if hasattr(model, 'get_output_length'):
-                    out_lens = torch.tensor([model.get_output_length(l.item()) for l in x_lens])
-                else:
-                    out_lens = x_lens.clone()
-                out_lens = torch.clamp(out_lens, max=logits.size(1))
-                y_lens_c = torch.clamp(y_lens, max=logits.size(1) - 1)
-                loss = criterion(logits.permute(1, 0, 2).cpu(), y, out_lens, y_lens_c)
         else:
             logits = model(x, sids)
-            if hasattr(model, 'get_output_length'):
-                out_lens = torch.tensor([model.get_output_length(l.item()) for l in x_lens])
-            else:
-                out_lens = x_lens.clone()
-            out_lens = torch.clamp(out_lens, max=logits.size(1))
-            y_lens_c = torch.clamp(y_lens, max=logits.size(1) - 1)
-            logits_cpu = logits.permute(1, 0, 2).cpu() if CFG.DEVICE == "mps" else logits.permute(1, 0, 2)
-            loss = criterion(logits_cpu, y, out_lens, y_lens_c)
+
+        # Prepare lengths for CTC
+        if hasattr(model, 'get_output_length'):
+            out_lens = torch.tensor([model.get_output_length(l.item()) for l in x_lens]).to(CFG.DEVICE)
+        else:
+            out_lens = x_lens.clone().to(CFG.DEVICE)
+
+        out_lens = torch.clamp(out_lens, max=logits.size(1))
+        y_lens = torch.minimum(y_lens.to(CFG.DEVICE), out_lens).long()
+
+        out_l_cpu = out_lens.detach().cpu()
+        y_l_cpu = y_lens.detach().cpu()
+        sample_count += int(y_l_cpu.numel())
+        if y_l_cpu.numel() > 0:
+            tgt_len_sum += float(y_l_cpu.float().sum().item())
+            out_len_sum += float(out_l_cpu.float().sum().item())
+            tgt_min = min(tgt_min, int(y_l_cpu.min().item()))
+            tgt_max = max(tgt_max, int(y_l_cpu.max().item()))
+            out_min = min(out_min, int(out_l_cpu.min().item()))
+            out_max = max(out_max, int(out_l_cpu.max().item()))
+
+        # CTC loss expects [T,B,C]
+        log_probs = logits.log_softmax(-1).permute(1, 0, 2)
+
+        loss = criterion(log_probs, y, out_lens, y_lens)
 
         if torch.isnan(loss) or torch.isinf(loss):
+            batches_bad_loss += 1
             continue
 
         loss = loss / CFG.GRAD_ACCUM
@@ -777,7 +824,8 @@ def train_epoch(model, loader, criterion, optimizer, scaler, epoch):
         else:
             loss.backward()
 
-        if (step + 1) % CFG.GRAD_ACCUM == 0:
+        accum_steps += 1
+        if accum_steps == CFG.GRAD_ACCUM:
             if use_amp and scaler:
                 scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 10.0)
@@ -787,10 +835,47 @@ def train_epoch(model, loader, criterion, optimizer, scaler, epoch):
             else:
                 optimizer.step()
             optimizer.zero_grad()
+            accum_steps = 0
 
         total_loss += loss.item() * CFG.GRAD_ACCUM
         n += 1
-        pbar.set_postfix(loss=f"{total_loss/n:.4f}")
+        pbar.set_postfix(
+            loss=f"{total_loss/max(n,1):.4f}",
+            bad=f"{batches_bad_loss}",
+            empty=f"{batches_empty_target}",
+        )
+
+    # Flush leftover micro-batch gradients when len(loader) is not divisible by GRAD_ACCUM.
+    if accum_steps > 0:
+        if CFG.DEVICE == "cuda" and scaler is not None:
+            scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 10.0)
+        if CFG.DEVICE == "cuda" and scaler is not None:
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            optimizer.step()
+        optimizer.zero_grad()
+
+    if CFG.TRAIN_DEBUG:
+        avg_tgt = (tgt_len_sum / sample_count) if sample_count > 0 else 0.0
+        avg_out = (out_len_sum / sample_count) if sample_count > 0 else 0.0
+        print(
+            f"    [TrainDiag] batches={batches_total} used={n} bad_loss={batches_bad_loss} "
+            f"empty_target={batches_empty_target} y_len(avg/min/max)={avg_tgt:.1f}/{(tgt_min if tgt_max >= 0 else 0)}/{(tgt_max if tgt_max >= 0 else 0)} "
+            f"out_len(avg/min/max)={avg_out:.1f}/{(out_min if out_max >= 0 else 0)}/{(out_max if out_max >= 0 else 0)}"
+        )
+
+    if n == 0:
+        raise RuntimeError(
+            "No valid training batches produced finite CTC loss. "
+            "Check target preprocessing and sequence lengths."
+        )
+    if CFG.FAIL_FAST_ON_BAD_LOSS and batches_bad_loss > max(10, int(0.3 * max(1, batches_total))):
+        raise RuntimeError(
+            f"Too many invalid training losses: {batches_bad_loss}/{batches_total}. "
+            "Likely target/output length mismatch or malformed labels."
+        )
 
     return total_loss / max(n, 1)
 
@@ -799,9 +884,12 @@ def validate_epoch(model, loader, criterion, lm_decoder=None, use_beam=False):
     model.eval()
     total_loss, n = 0.0, 0
     all_pred, all_true = [], []
+    batches_total = 0
+    unlabeled_samples = 0
 
     with torch.no_grad():
         for batch in tqdm(loader, desc="[Val]", leave=False):
+            batches_total += 1
             x, y, x_lens, y_lens, sids = batch[:5]
             x = x.to(CFG.DEVICE)
             sids = sids.to(CFG.DEVICE)
@@ -813,22 +901,35 @@ def validate_epoch(model, loader, criterion, lm_decoder=None, use_beam=False):
             else:
                 logits = model(x, sids)
 
-            # Loss
-            if hasattr(model, 'get_output_length'):
-                out_lens = torch.tensor([model.get_output_length(l.item()) for l in x_lens])
-            else:
-                out_lens = x_lens.clone()
-            out_lens = torch.clamp(out_lens, max=logits.size(1))
-            y_lens_c = torch.clamp(y_lens, max=logits.size(1) - 1)
-            loss = criterion(logits.permute(1, 0, 2).float().cpu(), y, out_lens, y_lens_c)
-            if not (torch.isnan(loss) or torch.isinf(loss)):
-                total_loss += loss.item() * x.size(0)
-                n += x.size(0)
+            # Loss: only on labeled samples (y_len > 0)
+            labeled_idx = torch.nonzero(y_lens > 0, as_tuple=False).squeeze(1)
+            unlabeled_samples += int(y_lens.numel() - labeled_idx.numel())
+            if labeled_idx.numel() > 0:
+                logits_l = logits.index_select(0, labeled_idx.to(logits.device))
+                y_l = y.index_select(0, labeled_idx)
+                x_lens_l = x_lens.index_select(0, labeled_idx)
+                y_lens_l = y_lens.index_select(0, labeled_idx)
+
+                if hasattr(model, 'get_output_length'):
+                    out_lens = torch.tensor([model.get_output_length(l.item()) for l in x_lens_l])
+                else:
+                    out_lens = x_lens_l.clone()
+                out_lens = torch.clamp(out_lens, max=logits_l.size(1))
+                y_lens_c = torch.minimum(y_lens_l, out_lens).long()
+                loss = criterion(logits_l.log_softmax(-1).permute(1, 0, 2).float().cpu(), y_l, out_lens, y_lens_c)
+                if not (torch.isnan(loss) or torch.isinf(loss)):
+                    total_loss += loss.item() * logits_l.size(0)
+                    n += logits_l.size(0)
 
             # Decode
             logits_cpu = logits.float().cpu()
             for i in range(x.size(0)):
-                ol = min(logits.size(1), out_lens[i].item()) if hasattr(model, 'get_output_length') else x_lens[i].item()
+                if y_lens[i].item() <= 0:
+                    continue
+                if hasattr(model, 'get_output_length'):
+                    ol = min(logits.size(1), int(model.get_output_length(x_lens[i].item())))
+                else:
+                    ol = x_lens[i].item()
                 pred_logits = logits_cpu[i, :ol, :]
 
                 if use_beam and lm_decoder:
@@ -839,8 +940,14 @@ def validate_epoch(model, loader, criterion, lm_decoder=None, use_beam=False):
                     pred = greedy_decode(pred_logits)
 
                 true = " ".join([TOKEN_MAP.get(idx.item(), "") for idx in y[i, :y_lens[i]]])
-                all_pred.append(pred)
-                all_true.append(true)
+                all_pred.append(normalize_phoneme_text(pred))
+                all_true.append(normalize_phoneme_text(true))
+
+    if CFG.TRAIN_DEBUG:
+        print(
+            f"    [ValDiag] batches={batches_total} labeled={n} unlabeled={unlabeled_samples} "
+            f"pairs_for_wer={len(all_true)}"
+        )
 
     wer = jiwer.wer(all_true, all_pred) if all_true else 1.0
     return total_loss / max(n, 1), wer
@@ -870,6 +977,270 @@ def tta_predict(model, x_numpy, session_id, sigmas=None):
 
     return torch.stack(all_logits).mean(0)[0]  # [T, C]
 
+def _average_variable_length_logits(logits_list):
+    """Average a list of [T_i, C] logits without padding bias."""
+    if not logits_list:
+        return None
+    if len(logits_list) == 1:
+        return logits_list[0]
+
+    max_len = max(l.size(0) for l in logits_list)
+    n_classes = logits_list[0].size(1)
+    device = logits_list[0].device
+    dtype = logits_list[0].dtype
+
+    sum_logits = torch.zeros((max_len, n_classes), dtype=dtype, device=device)
+    counts = torch.zeros((max_len, 1), dtype=dtype, device=device)
+    for l in logits_list:
+        L = l.size(0)
+        sum_logits[:L] += l
+        counts[:L] += 1.0
+
+    return sum_logits / torch.clamp(counts, min=1.0)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TEXT NORMALIZATION + CANDIDATE SELECTION (WER-ORIENTED)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def normalize_phoneme_text(s: str) -> str:
+    """Conservative normalization to avoid 'cheap' WER penalties.
+
+    Assumes the transcript is a space-separated phoneme sequence with optional '|' token.
+    We intentionally *do not* remove tokens, only normalize whitespace and casing.
+    """
+    if s is None:
+        return ""
+    s = str(s).strip().upper()
+    # Collapse whitespace
+    s = " ".join(s.split())
+    # Normalize spacing around '|'
+    s = s.replace(" | ", " | ").replace("| ", "| ").replace(" |", " |")
+    # Ensure single-spaced tokens
+    s = " ".join(s.split())
+    # Collapse consecutive separators
+    toks = s.split(" ")
+    out = []
+    prev = None
+    for t in toks:
+        if t == "" or t is None:
+            continue
+        if t == "|" and prev == "|":
+            continue
+        out.append(t)
+        prev = t
+    return " ".join(out).strip()
+
+def dedupe_hypotheses(hyps, keep_top=200):
+    """Deduplicate hypotheses by normalized text, keep best (max score)."""
+    best = {}
+    for txt, score in hyps:
+        n = normalize_phoneme_text(txt)
+        if not n:
+            continue
+        if n not in best or score > best[n]:
+            best[n] = score
+    items = sorted(best.items(), key=lambda x: x[1], reverse=True)[:keep_top]
+    return [(t, s) for t, s in items]
+
+class CandidateSelector:
+    """Competition-style selector: combine beam/LM scores with optional LLM scoring."""
+
+    def __init__(self, llm_rescorer=None):
+        self.llm = llm_rescorer
+
+    def select(self, hyps, topk_llm=30):
+        if not hyps:
+            return ""
+        hyps = dedupe_hypotheses(hyps, keep_top=max(topk_llm, 50))
+
+        # If no LLM, return best beam score
+        if self.llm is None or self.llm.model is None or not CFG.USE_LLM_RESCORE:
+            return hyps[0][0]
+
+        # Only score top-k with LLM for speed
+        scored = []
+        for i, (txt, beam_score) in enumerate(hyps):
+            if i < topk_llm:
+                llm_score = self.llm.score(txt)
+                combined = beam_score + CFG.LLM_WEIGHT * llm_score
+            else:
+                combined = beam_score
+            scored.append((txt, combined))
+        scored.sort(key=lambda x: x[1], reverse=True)
+        return scored[0][0]
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# REPORT PLOTS (saved to OUTPUT_DIR)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _per_utterance_wer(truths, preds):
+    """Return list of per-utterance WER values."""
+    wers = []
+    for t, p in zip(truths, preds):
+        t_n = normalize_phoneme_text(t)
+        p_n = normalize_phoneme_text(p)
+        try:
+            w = jiwer.wer([t_n], [p_n])
+        except Exception:
+            w = 1.0
+        wers.append(float(w))
+    return wers
+
+def _align_tokens(ref_tokens, hyp_tokens):
+    """Levenshtein alignment on token sequences."""
+    n, m = len(ref_tokens), len(hyp_tokens)
+    dp = np.zeros((n + 1, m + 1), dtype=np.int32)
+    bt = np.zeros((n + 1, m + 1), dtype=np.int8)  # 0=diag, 1=up(del), 2=left(ins)
+
+    for i in range(1, n + 1):
+        dp[i, 0] = i
+        bt[i, 0] = 1
+    for j in range(1, m + 1):
+        dp[0, j] = j
+        bt[0, j] = 2
+
+    for i in range(1, n + 1):
+        r = ref_tokens[i - 1]
+        for j in range(1, m + 1):
+            h = hyp_tokens[j - 1]
+            c_diag = dp[i - 1, j - 1] + (0 if r == h else 1)
+            c_up = dp[i - 1, j] + 1
+            c_left = dp[i, j - 1] + 1
+
+            best = c_diag
+            op = 0
+            if c_up < best:
+                best = c_up
+                op = 1
+            if c_left < best:
+                best = c_left
+                op = 2
+
+            dp[i, j] = best
+            bt[i, j] = op
+
+    i, j = n, m
+    aligned = []
+    while i > 0 or j > 0:
+        if i > 0 and j > 0 and bt[i, j] == 0:
+            r = ref_tokens[i - 1]
+            h = hyp_tokens[j - 1]
+            if r == h:
+                aligned.append(("eq", r, h))
+            else:
+                aligned.append(("sub", r, h))
+            i -= 1
+            j -= 1
+        elif i > 0 and (j == 0 or bt[i, j] == 1):
+            aligned.append(("del", ref_tokens[i - 1], None))
+            i -= 1
+        else:
+            aligned.append(("ins", None, hyp_tokens[j - 1]))
+            j -= 1
+
+    aligned.reverse()
+    return aligned
+
+def _phoneme_substitution_matrix(truths, preds, top_k=18):
+    """Build substitution confusion matrix for top phonemes."""
+    subs = defaultdict(int)
+    token_mass = defaultdict(int)
+
+    for t, p in zip(truths, preds):
+        t_tokens = normalize_phoneme_text(t).split()
+        p_tokens = normalize_phoneme_text(p).split()
+        for op, ref_t, hyp_t in _align_tokens(t_tokens, p_tokens):
+            if op == "sub" and ref_t and hyp_t:
+                subs[(ref_t, hyp_t)] += 1
+                token_mass[ref_t] += 1
+                token_mass[hyp_t] += 1
+
+    if not subs:
+        return None, None
+
+    tokens = [t for t, _ in sorted(token_mass.items(), key=lambda x: x[1], reverse=True)[:top_k]]
+    tok_to_idx = {t: i for i, t in enumerate(tokens)}
+    mat = np.zeros((len(tokens), len(tokens)), dtype=np.float32)
+    for (r, h), cnt in subs.items():
+        if r in tok_to_idx and h in tok_to_idx:
+            mat[tok_to_idx[r], tok_to_idx[h]] += float(cnt)
+
+    return mat, tokens
+
+def save_report_plots(truths, preds, out_dir):
+    """Create plots you can drop into the report."""
+    os.makedirs(out_dir, exist_ok=True)
+
+    # Token lengths
+    t_lens = [len(normalize_phoneme_text(t).split()) for t in truths]
+    p_lens = [len(normalize_phoneme_text(p).split()) for p in preds]
+    wers = _per_utterance_wer(truths, preds)
+
+    # 1) Length scatter (true vs pred)
+    plt.figure(figsize=(6, 5))
+    plt.scatter(t_lens, p_lens, s=12, alpha=0.6)
+    mx = max(t_lens + p_lens + [1])
+    plt.plot([0, mx], [0, mx], linewidth=1)
+    plt.xlabel("True length (tokens)")
+    plt.ylabel("Predicted length (tokens)")
+    plt.title("Length sanity check: true vs predicted")
+    plt.grid(True, alpha=0.25)
+    plt.tight_layout()
+    plt.savefig(os.path.join(out_dir, "inference_length_scatter.png"), dpi=200)
+    plt.close()
+
+    # 2) Length histograms
+    plt.figure(figsize=(8, 4))
+    plt.hist(t_lens, bins=30, alpha=0.6, label="True")
+    plt.hist(p_lens, bins=30, alpha=0.6, label="Pred")
+    plt.xlabel("Length (tokens)")
+    plt.ylabel("Count")
+    plt.title("Length distribution")
+    plt.legend()
+    plt.grid(True, alpha=0.25)
+    plt.tight_layout()
+    plt.savefig(os.path.join(out_dir, "length_histograms.png"), dpi=200)
+    plt.close()
+
+    # 3) WER vs length (binned)
+    # Bin by true length
+    bins = [0, 10, 20, 30, 40, 60, 80, 120, 2000]
+    bin_labels = []
+    bin_wers = []
+    for a, b in zip(bins[:-1], bins[1:]):
+        idx = [i for i, L in enumerate(t_lens) if a <= L < b]
+        if not idx:
+            continue
+        bin_labels.append(f"{a}-{b-1}")
+        bin_wers.append(float(np.mean([wers[i] for i in idx])) * 100)
+
+    plt.figure(figsize=(10, 4))
+    plt.plot(range(len(bin_wers)), bin_wers, marker='o')
+    plt.xticks(range(len(bin_labels)), bin_labels, rotation=30, ha='right')
+    plt.ylabel("WER (%)")
+    plt.xlabel("True length bin (tokens)")
+    plt.title("WER by utterance length")
+    plt.grid(True, alpha=0.25)
+    plt.tight_layout()
+    plt.savefig(os.path.join(out_dir, "wer_by_length.png"), dpi=200)
+    plt.close()
+
+    # 4) Phoneme substitution confusion matrix
+    mat, toks = _phoneme_substitution_matrix(truths, preds, top_k=18)
+    if mat is not None and mat.size > 0 and np.any(mat > 0):
+        plt.figure(figsize=(10, 8))
+        im = plt.imshow(np.log1p(mat), interpolation="nearest", cmap="magma", aspect="auto")
+        plt.colorbar(im, label="log(1 + substitution count)")
+        plt.xticks(range(len(toks)), toks, rotation=90)
+        plt.yticks(range(len(toks)), toks)
+        plt.xlabel("Predicted phoneme")
+        plt.ylabel("True phoneme")
+        plt.title("Top phoneme substitutions (confusion matrix)")
+        plt.tight_layout()
+        plt.savefig(os.path.join(out_dir, "phoneme_confusion_matrix.png"), dpi=220)
+        plt.close()
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # MAIN TRAINING PIPELINE
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -886,6 +1257,7 @@ def run_pipeline():
     print(f"  Batch:       {CFG.BATCH_SIZE} × {CFG.GRAD_ACCUM} = {CFG.BATCH_SIZE * CFG.GRAD_ACCUM}")
     print(f"  K-Folds:     {CFG.N_FOLDS}")
     print(f"  Beam Width:  {CFG.BEAM_WIDTH}")
+    print(f"  Val decode:  {'beam' if CFG.VAL_USE_BEAM else 'greedy'}")
     print(f"  TTA:         {CFG.USE_TTA} ({CFG.TTA_SIGMAS})")
     print(f"  LLM:         {CFG.LLM_MODEL}")
 
@@ -943,34 +1315,41 @@ def run_pipeline():
         patience_ctr = 0
         history = {'train_loss': [], 'val_loss': [], 'wer': [], 'lr': []}
 
-        for epoch in range(1, CFG.EPOCHS + 1):
-            cur_lr = warmup_cosine_lr(optimizer, epoch - 1, CFG.WARMUP_EPOCHS, CFG.EPOCHS, CFG.LR_MIN)
+        for epoch in range(CFG.EPOCHS):
+            # Warmup + cosine
+            if epoch < CFG.WARMUP_EPOCHS:
+                cur_lr = lr * (epoch + 1) / CFG.WARMUP_EPOCHS
+            else:
+                cur_lr = cosine_lr(epoch - CFG.WARMUP_EPOCHS, max(1, CFG.EPOCHS - CFG.WARMUP_EPOCHS), lr, CFG.LR_MIN)
+            for pg in optimizer.param_groups:
+                pg['lr'] = cur_lr
 
-            train_loss = train_epoch(model, train_loader, criterion, optimizer, scaler, epoch)
-
-            # Validate with greedy for speed during training (beam search is slow)
-            val_loss, wer = validate_epoch(model, val_loader, criterion,
-                                            lm_decoder=None, use_beam=False)
+            train_loss = train_epoch(model, train_loader, optimizer, criterion, scaler)
+            val_loss, wer = validate_epoch(
+                model,
+                val_loader,
+                criterion,
+                lm_decoder=lm_decoder,
+                use_beam=CFG.VAL_USE_BEAM,
+            )
 
             history['train_loss'].append(train_loss)
             history['val_loss'].append(val_loss)
             history['wer'].append(wer)
             history['lr'].append(cur_lr)
 
-            print(f"  Ep {epoch:2d} | LR {cur_lr:.1e} | Loss {train_loss:.4f}/{val_loss:.4f} | WER {wer*100:.2f}%")
+            print(f"    Epoch {epoch+1:02d}: train={train_loss:.4f} val={val_loss:.4f} WER={wer*100:.2f}% lr={cur_lr:.2e}")
 
+            # Early stopping on WER
             if wer < best_wer:
                 best_wer = wer
                 best_state = copy.deepcopy(model.state_dict())
                 patience_ctr = 0
-                torch.save(best_state, os.path.join(CFG.OUTPUT_DIR, f"fold_{fold}_best.pt"))
-                print(f"       → Best! Saved (WER={wer*100:.2f}%)")
             else:
                 patience_ctr += 1
-
-            if patience_ctr >= CFG.PATIENCE:
-                print(f"       → Early stopping (patience={CFG.PATIENCE})")
-                break
+                if patience_ctr >= CFG.PATIENCE:
+                    print(f"       → Early stopping (patience={CFG.PATIENCE})")
+                    break
 
         fold_states.append(best_state)
         fold_wers.append(best_wer)
@@ -1004,11 +1383,19 @@ def run_pipeline():
 
     return final_wer
 
+
 def _ensemble_inference(fold_states, test_ds, lm_decoder, llm_rescorer):
-    """Run ensemble inference with TTA, KenLM, and LLM rescoring."""
+    """Run ensemble inference with competition-style candidate pooling + selection.
+
+    Key improvements vs the original:
+      - Pool N-best candidates across multiple TTA smoothing sigmas
+      - Average logits across folds *per sigma* (logit-level ensemble)
+      - Deduplicate hypotheses and pick the best using beam/LM score + optional LLM score
+      - Save report-ready plots at the end
+    """
     # Load all fold models
     models = []
-    for i, state in enumerate(fold_states):
+    for state in fold_states:
         if CFG.MODE == "finetune":
             m = GRUDecoder(n_days=CFG.N_SESSIONS)
         else:
@@ -1018,62 +1405,110 @@ def _ensemble_inference(fold_states, test_ds, lm_decoder, llm_rescorer):
         m.eval()
         models.append(m)
 
+    selector = CandidateSelector(llm_rescorer)
+
     test_loader = DataLoader(test_ds, batch_size=1, shuffle=False,
-                              collate_fn=collate_fn, num_workers=0)
+                             collate_fn=collate_fn, num_workers=0)
 
     all_pred, all_true = [], []
+    eval_pred, eval_true = [], []
+    used_sigmas = CFG.TTA_SIGMAS if CFG.USE_TTA else [CFG.SMOOTHING_SIGMA]
 
     for batch in tqdm(test_loader, desc="Ensemble Inference"):
         x, y, x_lens, y_lens, sids = batch[:5]
+        session_id = int(sids[0].item())
+        x_np = x[0].numpy()
 
-        # Average logits across folds
-        fold_logits = []
-        for model in models:
-            if CFG.USE_TTA:
-                logits = tta_predict(model, x[0].numpy(), sids[0].item())
-            else:
-                xt = x.to(CFG.DEVICE)
-                sid = sids.to(CFG.DEVICE)
+        true = ""
+        has_label = int(y_lens[0].item()) > 0
+        if has_label:
+            true = " ".join([TOKEN_MAP.get(idx.item(), "") for idx in y[0, :y_lens[0]]])
+            true = normalize_phoneme_text(true)
+        all_true.append(true)
+
+        pooled_hyps = []
+
+        # --- Per-sigma logit ensemble (fold average) ---
+        sigma_logits_list = []
+        for sigma in used_sigmas:
+            fold_logits = []
+            x_s = smooth_data(x_np, sigma=sigma)
+
+            for model in models:
+                xt = torch.tensor(x_s, dtype=torch.float32).unsqueeze(0).to(CFG.DEVICE)
+                sid = torch.tensor([session_id], dtype=torch.long).to(CFG.DEVICE)
+
                 with torch.no_grad():
                     if CFG.DEVICE == "cuda":
                         with autocast('cuda', dtype=torch.bfloat16):
                             logits = model(xt, sid)[0].float().cpu()
                     else:
-                        logits = model(xt, sid)[0].cpu()
+                        logits = model(xt, sid)[0].float().cpu()
 
-            # Clip to output length
-            if hasattr(model, 'get_output_length'):
-                ol = model.get_output_length(x_lens[0].item())
+                # Clip to output length
+                if hasattr(model, 'get_output_length'):
+                    ol = model.get_output_length(x_lens[0].item())
+                else:
+                    ol = x_lens[0].item()
+                ol = min(int(ol), logits.size(0))
+                fold_logits.append(logits[:ol])
+
+            # Average across folds without padding bias.
+            avg_logits = _average_variable_length_logits(fold_logits)
+            sigma_logits_list.append(avg_logits)
+
+            # Decode N-best for this sigma and add to pool
+            if lm_decoder is not None:
+                hyps = lm_decoder.decode_nbest(avg_logits, n_best=max(CFG.N_BEST, 30))
+                pooled_hyps.extend(hyps)
             else:
-                ol = x_lens[0].item()
-            ol = min(ol, logits.size(0))
-            fold_logits.append(logits[:ol])
+                pooled_hyps.append((ctc_beam_search(avg_logits, beam_width=CFG.BEAM_WIDTH), 0.0))
 
-        # Pad to same length and average
-        max_len = max(l.size(0) for l in fold_logits)
-        padded = [F.pad(l, (0, 0, 0, max_len - l.size(0)), value=-100) for l in fold_logits]
-        avg_logits = torch.stack(padded).mean(0)
+        # --- Also add a "sigma-averaged" logit ensemble candidate set ---
+        if len(sigma_logits_list) > 1:
+            avg_over_sigma = _average_variable_length_logits(sigma_logits_list)
+            if lm_decoder is not None:
+                hyps = lm_decoder.decode_nbest(avg_over_sigma, n_best=max(CFG.N_BEST, 50))
+                pooled_hyps.extend(hyps)
+            else:
+                pooled_hyps.append((ctc_beam_search(avg_over_sigma, beam_width=CFG.BEAM_WIDTH), 0.0))
 
-        # Decode
-        if CFG.USE_LLM_RESCORE and llm_rescorer.model is not None:
-            hyps = lm_decoder.decode_nbest(avg_logits)
-            pred = llm_rescorer.rescore(hyps)
-        elif lm_decoder.decoder is not None:
-            pred = lm_decoder.decode(avg_logits)
-        else:
-            pred = ctc_beam_search(avg_logits, beam_width=CFG.BEAM_WIDTH)
-
+        # --- Final selection ---
+        pred = selector.select(pooled_hyps, topk_llm=30)
+        pred = normalize_phoneme_text(pred)
         all_pred.append(pred)
-        true = " ".join([TOKEN_MAP.get(idx.item(), "") for idx in y[0, :y_lens[0]]])
-        all_true.append(true)
+        if has_label:
+            eval_true.append(true)
+            eval_pred.append(pred)
 
-    wer = jiwer.wer(all_true, all_pred) if all_true else 1.0
+    if eval_true:
+        wer = jiwer.wer(eval_true, eval_pred)
+    else:
+        wer = float('nan')
+        print("  WARNING: No labeled samples found in inference split; WER is undefined.")
+
+    # Save report plots
+    try:
+        if eval_true:
+            save_report_plots(eval_true, eval_pred, CFG.OUTPUT_DIR)
+        # Also save a CSV with predictions for easy inspection
+        pd.DataFrame(
+            {
+                "true": all_true,
+                "pred": all_pred,
+                "has_label": [int(t != "") for t in all_true],
+            }
+        ).to_csv(
+            os.path.join(CFG.OUTPUT_DIR, "inference_predictions.csv"), index=False
+        )
+    except Exception as e:
+        print(f"  WARNING: Could not save plots/CSV: {e}")
 
     # Show examples
     print(f"\n  Sample predictions:")
     for i in range(min(5, len(all_pred))):
-        print(f"    TRUE: {all_true[i][:80]}")
-        print(f"    PRED: {all_pred[i][:80]}")
+        print(f"    TRUE: {all_true[i][:120]}")
+        print(f"    PRED: {all_pred[i][:120]}")
         print()
 
     del models
@@ -1082,6 +1517,7 @@ def _ensemble_inference(fold_states, test_ds, lm_decoder, llm_rescorer):
     gc.collect()
 
     return wer
+
 
 def _plot_history(history, fold):
     """Save training history plot."""
